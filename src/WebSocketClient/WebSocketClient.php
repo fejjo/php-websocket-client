@@ -1,11 +1,14 @@
 <?php
 namespace WebSocketClient;
 
+use Evenement\EventEmitter;
+use Nette\Http\UrlScript;
 use React\EventLoop\LoopInterface;
-use React\Socket\Connection;
-use WebSocketClient\Exception\ConnectionException;
+use React\SocketClient\Connector;
+use React\SocketClient\SecureConnector;
+use React\Stream\DuplexStreamInterface;
 
-class WebSocketClient
+class WebSocketClient extends EventEmitter
 {
     const VERSION = '0.1.4';
     const TOKEN_LENGHT = 16;
@@ -21,29 +24,19 @@ class WebSocketClient
     const TYPE_ID_EVENT = 8;
 
     /**
-     * @var string
-     */
-    private $key;
-
-    /**
      * @var LoopInterface
      */
     private $loop;
 
     /**
-     * @var WebSocketClientInterface
+     * @var DuplexStreamInterface
      */
-    private $client;
+    private $socket;
 
     /**
      * @var string
      */
-    private $host;
-
-    /**
-     * @var int
-     */
-    private $port;
+    private $key;
 
     /**
      * @var string
@@ -51,14 +44,9 @@ class WebSocketClient
     private $origin;
 
     /**
-     * @var string
+     * @var UrlScript
      */
-    private $path;
-
-    /**
-     * @var Connection
-     */
-    private $socket;
+    private $endpoint;
 
     /**
      * @var bool
@@ -70,32 +58,15 @@ class WebSocketClient
      */
     private $callbacks = array();
 
-    /**
-     * @param WebSocketClientInterface $client
-     * @param LoopInterface $loop
-     * @param string $host
-     * @param int $port
-     * @param string $path
-     * @param null|string $origin
-     */
-    public function __construct(WebSocketClientInterface $client, LoopInterface $loop, $host = '127.0.0.1', $port = 8080, $path = '/', $origin = null)
-    {
-        $this->setLoop($loop);
-        $this->setHost($host);
-        $this->setPort($port);
-        $this->setPath($path);
-        $this->setClient($client);
-        $this->setOrigin($origin);
-        $this->setKey($this->generateToken(self::TOKEN_LENGHT));
 
-        $this->connect();
-        $client->setClient($this);
+
+    public function __construct(LoopInterface $loop)
+    {
+        $this->loop = $loop;
+        $this->key = $this->generateToken(self::TOKEN_LENGHT);
     }
 
-    /**
-     * Disconnect on destruct
-     */
-    function __destruct()
+    public function __destruct()
     {
         $this->disconnect();
     }
@@ -103,23 +74,43 @@ class WebSocketClient
     /**
      * Connect client to server
      *
-     * @throws ConnectionException
+     * @param string $endpoint
+     * @param string $origin
      * @return $this
      */
-    public function connect()
+    public function connect($endpoint, $origin = NULL)
     {
-        $root = $this;
+        $this->origin = $origin;
 
-        $client = @stream_socket_client("tcp://{$this->getHost()}:{$this->getPort()}");
-        if (!$client) {
-            throw new ConnectionException;
+        $this->endpoint = new UrlScript($endpoint);
+        $secured = $this->endpoint->getScheme() === 'wss';
+        if (!$this->endpoint->getPort()) {
+            $this->endpoint->setPort($secured ? 443 : 80);
         }
-        $this->setSocket(new Connection($client, $this->getLoop()));
-        $this->getSocket()->on('data', function ($data) use ($root) {
-            $data = $root->parseIncomingRaw($data);
-            $root->parseData($data);
-        });
-        $this->getSocket()->write($this->createHeader());
+
+        $dnsResolverFactory = new \React\Dns\Resolver\Factory();
+        $dns = $dnsResolverFactory->createCached('8.8.8.8', $this->loop);
+
+        $connector = new Connector($this->loop, $dns);
+        if ($secured) {
+            $connector = new SecureConnector($connector, $this->loop);
+        }
+
+        $connector->create($this->endpoint->getHost(), $this->endpoint->getPort())
+            ->then(function (DuplexStreamInterface $stream) {
+                $this->socket = $stream;
+
+                $stream->on('data', function ($data) {
+                    $data = $this->parseIncomingRaw($data);
+                    $this->parseData($data);
+                });
+                $stream->write($this->createHeader());
+
+                $this->emit('connect', [$stream]);
+
+            }, function ($reason) {
+                $this->emit('reject', $reason);
+            });
 
         return $this;
     }
@@ -130,7 +121,7 @@ class WebSocketClient
     public function disconnect()
     {
         $this->connected = false;
-        if ($this->socket instanceof Connection) {
+        if ($this->socket instanceof DuplexStreamInterface) {
             $this->socket->close();
         }
     }
@@ -215,7 +206,7 @@ class WebSocketClient
         if (isset($data[0])) {
             switch ($data[0]) {
                 case self::TYPE_ID_WELCOME:
-                    $this->getClient()->onWelcome($data);
+                    $this->emit('welcome', $data);
                     break;
                 case self::TYPE_ID_CALLRESULT:
                     if (isset($data[1])) {
@@ -228,7 +219,7 @@ class WebSocketClient
                     break;
                 case self::TYPE_ID_EVENT:
                     if (isset($data[1]) && isset($data[2])) {
-                        $this->getClient()->onEvent($data[1], $data[2]);
+                        $this->emit('message', [$data[1], $data[2]]);
                     }
                     break;
             }
@@ -247,7 +238,7 @@ class WebSocketClient
             return;
         }
 
-        $this->getSocket()->write($this->hybi10Encode(json_encode($data)));
+        $this->socket->write($this->hybi10Encode(json_encode($data)));
     }
 
     /**
@@ -284,18 +275,16 @@ class WebSocketClient
      */
     private function createHeader()
     {
-        $host = $this->getHost();
-        if ($host === '127.0.0.1' || $host === '0.0.0.0') {
-            $host = 'localhost';
-        }
-
-        $origin = $this->getOrigin() ? $this->getOrigin() : "null";
+        $path = $this->endpoint->getPath() . '?' . $this->endpoint->getQuery();
+        $origin = $this->origin ?: 'null';
+        $host = !in_array($host = $this->endpoint->getHost(), ['127.0.0.1', '0.0.0.0'], TRUE) ? $host : 'localhost';
+        $port = $this->endpoint->getPort();
 
         return
-            "GET {$this->getPath()} HTTP/1.1" . "\r\n" .
+            "GET {$path} HTTP/1.1" . "\r\n" .
             "Origin: {$origin}" . "\r\n" .
-            "Host: {$host}:{$this->getPort()}" . "\r\n" .
-            "Sec-WebSocket-Key: {$this->getKey()}" . "\r\n" .
+            "Host: {$host}:{$port}" . "\r\n" .
+            "Sec-WebSocket-Key: {$this->key}" . "\r\n" .
             "User-Agent: PHPWebSocketClient/" . self::VERSION . "\r\n" .
             "Upgrade: websocket" . "\r\n" .
             "Connection: Upgrade" . "\r\n" .
@@ -379,152 +368,6 @@ class WebSocketClient
         } while (strlen($token) < $length);
 
         return $token;
-    }
-
-    /**
-     * @param int $port
-     * @return $this
-     */
-    public function setPort($port)
-    {
-        $this->port = (int)$port;
-        return $this;
-    }
-
-    /**
-     * @return int
-     */
-    public function getPort()
-    {
-        return $this->port;
-    }
-
-    /**
-     * @param Connection $socket
-     * @return $this
-     */
-    public function setSocket(Connection $socket)
-    {
-        $this->socket = $socket;
-        return $this;
-    }
-
-    /**
-     * @return Connection
-     */
-    public function getSocket()
-    {
-        return $this->socket;
-    }
-
-    /**
-     * @param string $host
-     * @return $this
-     */
-    public function setHost($host)
-    {
-        $this->host = (string)$host;
-        return $this;
-    }
-
-    /**
-     * @return string
-     */
-    public function getHost()
-    {
-        return $this->host;
-    }
-
-    /**
-     * @param null|string $origin
-     */
-    public function setOrigin($origin)
-    {
-        if (null !== $origin) {
-            $this->origin = (string)$origin;
-        } else {
-            $this->origin = null;
-        }
-    }
-
-    /**
-     * @return null|string
-     */
-    public function getOrigin()
-    {
-        return $this->origin;
-    }
-
-    /**
-     * @param string $key
-     * @return $this
-     */
-    public function setKey($key)
-    {
-        $this->key = (string)$key;
-        return $this;
-    }
-
-    /**
-     * @return string
-     */
-    public function getKey()
-    {
-        return $this->key;
-    }
-
-    /**
-     * @param string $path
-     * @return $this
-     */
-    public function setPath($path)
-    {
-        $this->path = $path;
-        return $this;
-    }
-
-    /**
-     * @return string
-     */
-    public function getPath()
-    {
-        return $this->path;
-    }
-
-    /**
-     * @param WebSocketClientInterface $client
-     * @return $this
-     */
-    public function setClient(WebSocketClientInterface $client)
-    {
-        $this->client = $client;
-        return $this;
-    }
-
-    /**
-     * @return WebSocketClientInterface
-     */
-    public function getClient()
-    {
-        return $this->client;
-    }
-
-    /**
-     * @param LoopInterface $loop
-     * @return $this
-     */
-    public function setLoop(LoopInterface $loop)
-    {
-        $this->loop = $loop;
-        return $this;
-    }
-
-    /**
-     * @return LoopInterface
-     */
-    public function getLoop()
-    {
-        return $this->loop;
     }
 
     /**
